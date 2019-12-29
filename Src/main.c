@@ -26,7 +26,7 @@
 #include "setup.h"
 #include "config.h"
 #include "comms.h"
-//#include "hd44780.h"
+#include "hd44780.h"
 
 // Matlab includes and defines - from auto-code generation
 // ###############################################################################
@@ -60,7 +60,7 @@ extern TIM_HandleTypeDef htim_right;
 extern ADC_HandleTypeDef hadc1;
 extern ADC_HandleTypeDef hadc2;
 extern volatile adc_buf_t adc_buffer;
-//LCD_PCF8574_HandleTypeDef lcd;
+LCD_PCF8574_HandleTypeDef lcd;
 extern I2C_HandleTypeDef hi2c2;
 extern UART_HandleTypeDef huart2;
 extern UART_HandleTypeDef huart3;
@@ -128,6 +128,12 @@ extern uint8_t nunchuck_data[6];
 extern volatile uint16_t ppm_captured_value[PPM_NUM_CHANNELS+1];
 #endif
 
+#define SPEED_MODE_FAST 0
+#define SPEED_MODE_SLOW 1
+#define SPEED_MODE_TURBO 2
+//uint8_t goSlow = false;                 // Slow mode
+uint8_t speedMode = SPEED_MODE_FAST;
+const int32_t throttle_mid = ADC1_MIN + ((ADC1_MAX - ADC1_MIN) / 2);
 
 void poweroff(void) {
   //  if (abs(speed) < 20) {  // wait for the speed to drop, then shut down -> this is commented out for SAFETY reasons
@@ -232,6 +238,22 @@ int main(void) {
 
   HAL_GPIO_WritePin(LED_PORT, LED_PIN, 1);
 
+  #ifdef CONTROL_ADC
+    button2 = (uint8_t)(adc_buffer.l_rx2 > 2000);  // ADC2 - my button
+
+    if (button2) {
+      speedMode = SPEED_MODE_FAST;
+      if (adc_buffer.l_tx2 > throttle_mid) { // throttle held down
+        speedMode = SPEED_MODE_TURBO;
+        rtP_Left.n_max = N_MOT_MAX_TURBO << 4; 
+        rtP_Right.n_max = N_MOT_MAX_TURBO << 4;
+      }
+    } else {
+      speedMode = SPEED_MODE_SLOW;
+      rtP_Left.n_max = N_MOT_MAX_SLOW << 4; 
+      rtP_Right.n_max = N_MOT_MAX_SLOW << 4; 
+    }
+  #endif
 
   #ifdef CONTROL_PPM
     PPM_Init();
@@ -254,10 +276,11 @@ int main(void) {
     HAL_UART_Receive_DMA(&huart, (uint8_t *)&command, sizeof(command));
   #endif
 
+
   #ifdef DEBUG_I2C_LCD
     I2C_Init();
     HAL_Delay(50);
-    lcd.pcf8574.PCF_I2C_ADDRESS = 0x27;
+    lcd.pcf8574.PCF_I2C_ADDRESS = 0x20;
       lcd.pcf8574.PCF_I2C_TIMEOUT = 5;
       lcd.pcf8574.i2c = hi2c2;
       lcd.NUMBER_OF_LINES = NUMBER_OF_LINES_2;
@@ -268,12 +291,49 @@ int main(void) {
           //TODO while(1);
       }
 
+    uint8_t battChar[8] = {
+	  0b01110,
+	  0b11011,
+	  0b10001,
+	  0b11111,
+	  0b11111,
+	  0b11111,
+	  0b11111,
+	  0b11111
+    };
+
+    LCD_CustomChar(&lcd, battChar, 2);
+
     LCD_ClearDisplay(&lcd);
     HAL_Delay(5);
     LCD_SetLocation(&lcd, 0, 0);
-    LCD_WriteString(&lcd, "Hover V2.0");
+    LCD_WriteString(&lcd, "Kratoffel");
     LCD_SetLocation(&lcd, 0, 1);
+    LCD_WriteString(&lcd, "@blankers.eu");
+    HAL_Delay(1000);
+    LCD_ClearDisplay(&lcd);
+    HAL_Delay(5);
+    LCD_SetLocation(&lcd, 0, 0);
     LCD_WriteString(&lcd, "Initializing...");
+    LCD_SetLocation(&lcd, 0, 1);
+    switch(speedMode) {
+        case SPEED_MODE_SLOW:
+          LCD_WriteString(&lcd, "           SLOW");
+          break;
+        case SPEED_MODE_FAST:
+          LCD_WriteString(&lcd, "           FAST");
+          break;
+        case SPEED_MODE_TURBO:
+          LCD_WriteString(&lcd, "          TURBO");
+          break;
+
+    }
+  #endif
+
+  #ifdef CONTROL_ADC
+    while (adc_buffer.l_tx2 > throttle_mid) {
+        HAL_Delay(100);
+    }
   #endif
 
 
@@ -306,23 +366,56 @@ int main(void) {
 
     #ifdef CONTROL_ADC
       // ADC values range: 0-4095, see ADC-calibration in config.h
-      #ifdef ADC1_MID_POT
-        cmd1 = CLAMP((adc_buffer.l_tx2 - ADC1_MID) * INPUT_MAX / (ADC1_MAX - ADC1_MID), 0, INPUT_MAX) 
+      #ifdef ADC1_MID_POT // ADC1 - speed -> cmd2 (default cmd1)
+        cmd2 = CLAMP((adc_buffer.l_tx2 - ADC1_MID) * INPUT_MAX / (ADC1_MAX - ADC1_MID), 0, INPUT_MAX) 
               -CLAMP((ADC1_MID - adc_buffer.l_tx2) * INPUT_MAX / (ADC1_MID - ADC1_MIN), 0, INPUT_MAX);    // ADC1        
       #else
-        cmd1 = CLAMP((adc_buffer.l_tx2 - ADC1_MIN) * INPUT_MAX / (ADC1_MAX - ADC1_MIN), 0, INPUT_MAX);    // ADC1
+        if (speedMode == SPEED_MODE_TURBO) {
+            cmd2 = CLAMP((adc_buffer.l_tx2 - ADC1_MIN) * INPUT_MAX / (ADC1_MAX - ADC1_MIN), 0, INPUT_MAX);    // ADC1
+        } else {
+            cmd2 = CLAMP((adc_buffer.l_tx2 - ADC1_MIN) * 1000 / (ADC1_MAX - ADC1_MIN), 0, 1000);    // ADC1
+        }
       #endif
 
-      #ifdef ADC2_MID_POT
-        cmd2 = CLAMP((adc_buffer.l_rx2 - ADC2_MID) * INPUT_MAX / (ADC2_MAX - ADC2_MID), 0, INPUT_MAX)  
+      #ifdef ADC2_MID_POT // ADC2 - steer/button
+        cmd1 = CLAMP((adc_buffer.l_rx2 - ADC2_MID) * INPUT_MAX / (ADC2_MAX - ADC2_MID), 0, INPUT_MAX)  
               -CLAMP((ADC2_MID - adc_buffer.l_rx2) * INPUT_MAX / (ADC2_MID - ADC2_MIN), 0, INPUT_MAX);    // ADC2        
       #else
-        cmd2 = CLAMP((adc_buffer.l_rx2 - ADC2_MIN) * INPUT_MAX / (ADC2_MAX - ADC2_MIN), 0, INPUT_MAX);    // ADC2
+        cmd1 = CLAMP((adc_buffer.l_rx2 - ADC2_MIN) * INPUT_MAX / (ADC2_MAX - ADC2_MIN), 0, INPUT_MAX);    // ADC2
       #endif  
 
       // use ADCs as button inputs:
       button1 = (uint8_t)(adc_buffer.l_tx2 > 2000);  // ADC1
-      button2 = (uint8_t)(adc_buffer.l_rx2 > 2000);  // ADC2
+      button2 = (uint8_t)(adc_buffer.l_rx2 > 2000);  // ADC2 - my button
+
+      static uint8_t doBrake = false;
+      doBrake = false;
+      uint8_t realSpeed = (rtY_Left.n_mot-rtY_Right.n_mot) / 2;
+      if (button2) { // reverse or brake
+        if (realSpeed > 20) {
+            // Brake by applying negative torque
+            /*if (cmd2 > 50)
+                cmd2 = -realSpeed - cmd2;
+            else
+                cmd2 = -200 -realSpeed - cmd2;*/
+            cmd2 = -cmd2;
+            if (cmd2 < INPUT_MIN)
+                cmd2 = INPUT_MIN;
+            doBrake = true;
+        } else {
+            cmd2 = -cmd2 / 2;
+        }
+      } else if (realSpeed < -20) {
+        // Brake by applying positive torque
+        /*if (cmd2 > 50)
+          cmd2 = -realSpeed + cmd2;
+        else
+          cmd2 = 200 -realSpeed + cmd2;*/
+  
+        if (cmd2 > INPUT_MAX)
+            cmd2 = INPUT_MAX;
+        doBrake = true;
+      }
 
       timeout = 0;
     #endif
@@ -375,18 +468,36 @@ int main(void) {
       consoleLog("-- Motors enabled --\r\n");
     }
 
+    if (speedMode == SPEED_MODE_SLOW) {
+      cmd2 = cmd2 / 3;
+    }
+
     // ####### LOW-PASS FILTER #######
     rateLimiter16(cmd1, RATE, &steerRateFixdt);
     rateLimiter16(cmd2, RATE, &speedRateFixdt);
+    #ifdef CONTROL_ADC
+    filtLowPass16(steerRateFixdt >> 4, FILTER, &steerFixdt);
+    if (doBrake) {
+        filtLowPass16(speedRateFixdt >> 4, FILTER_BRAKE, &speedFixdt);
+    } else {
+        filtLowPass16(speedRateFixdt >> 4, FILTER, &speedFixdt);
+    }
+    #else
     filtLowPass16(steerRateFixdt >> 4, FILTER, &steerFixdt);
     filtLowPass16(speedRateFixdt >> 4, FILTER, &speedFixdt);
+    #endif
     steer = steerFixdt >> 4;  // convert fixed-point to integer
     speed = speedFixdt >> 4;  // convert fixed-point to integer    
 
     // ####### MIXER #######
     // speedR = CLAMP((int)(speed * SPEED_COEFFICIENT -  steer * STEER_COEFFICIENT), -1000, 1000);
     // speedL = CLAMP((int)(speed * SPEED_COEFFICIENT +  steer * STEER_COEFFICIENT), -1000, 1000);
-    mixerFcn(speedFixdt, steerFixdt, &speedR, &speedL);   // This function implements the equations above
+    // mixerFcn function implements the equations above
+    if (speedMode == SPEED_MODE_TURBO) {
+        mixerFcn(speedFixdt, steerFixdt, &speedR, &speedL, SPEED_COEFFICIENT_TURBO);
+    } else {
+        mixerFcn(speedFixdt, steerFixdt, &speedR, &speedL, SPEED_COEFFICIENT);
+    }
 
     // ####### SET OUTPUTS (if the target change is less than +/- 50) #######
     if ((speedL > lastSpeedL-50 && speedL < lastSpeedL+50) && (speedR > lastSpeedR-50 && speedR < lastSpeedR+50) && timeout < TIMEOUT) {
@@ -414,6 +525,47 @@ int main(void) {
     serialSendCounter++;              // Increment the counter
     if (serialSendCounter > 20) {     // Send data every 100 ms = 20 * 5 ms, where 5 ms is approximately the main loop duration
       serialSendCounter = 0;          // Reset the counter
+
+    #ifdef DEBUG_I2C_LCD
+      static uint8_t LCDCounter = 0;
+      if (LCDCounter % 10 == 0 && enable) { // Update LCD every second
+        // Clear first row
+        LCD_SetLocation(&lcd, 0, 0);
+        LCD_WriteString(&lcd, "                ");
+        LCD_SetLocation(&lcd, 0, 1);
+        LCD_WriteString(&lcd, "                ");
+
+        // speedR and speedL -1000 to 1000, display as percentage
+        LCD_SetLocation(&lcd, 0, 0);
+        LCD_WriteString(&lcd, "L");
+        LCD_WriteFloat(&lcd, (double) (speedL/10), 0);
+        LCD_SetLocation(&lcd, 5, 0);
+        LCD_WriteString(&lcd, "R");
+        LCD_WriteFloat(&lcd, (double) (speedR/10), 0);
+
+        // Battery percentage
+        int16_t batPercentage = 100 * batVoltage / (BAT_FULL);
+        if (batPercentage > 100)
+          batPercentage = 100;
+        if (batPercentage < 0)
+          batPercentage = 0;
+        if (batPercentage < 100)
+          LCD_SetLocation(&lcd, 12, 0);
+        else
+          LCD_SetLocation(&lcd, 11, 0);
+
+        LCD_WriteString(&lcd, "\x02"); // Battery icon
+        // batVoltage * BAT_CALIB_REAL_VOLTAGE / BAT_CALIB_ADC gives voltage x100
+        LCD_WriteFloat(&lcd, batPercentage, 0);
+        LCD_WriteString(&lcd, "%");
+
+        LCD_SetLocation(&lcd, 10, 1);
+        LCD_WriteFloat(&lcd, (int16_t) cmd2, 0);
+        //LCD_SetLocation(&lcd, 0, 1);
+        //LCD_WriteFloat(&lcd, cmd2, 0);
+      }
+      LCDCounter++;
+    #endif
 
     // ####### DEBUG SERIAL OUT #######
     #if defined(DEBUG_SERIAL_USART2) || defined(DEBUG_SERIAL_USART3)
@@ -467,7 +619,12 @@ int main(void) {
 
     // ####### BEEP AND EMERGENCY POWEROFF #######
     if ((TEMP_POWEROFF_ENABLE && board_temp_deg_c >= TEMP_POWEROFF && abs(speed) < 20) || (batVoltage < BAT_LOW_DEAD && abs(speed) < 20)) {  // poweroff before mainboard burns OR low bat 3
-      poweroff();
+      enable = 0;
+      #ifdef DEBUG_I2C_LCD
+        LCD_SetLocation(&lcd, 14, 1);
+        LCD_WriteString(&lcd, "UV");
+      #endif
+      //poweroff();
     } else if (TEMP_WARNING_ENABLE && board_temp_deg_c >= TEMP_WARNING) {  // beep if mainboard gets hot
       buzzerFreq = 4;
       buzzerPattern = 1;
@@ -480,7 +637,25 @@ int main(void) {
     } else if (errCode_Left || errCode_Right || timeoutFlag) {  // beep in case of Motor error or serial timeout - fast beep
       buzzerFreq = 12;
       buzzerPattern = 1;
-    } else if (BEEPS_BACKWARD && speed < -50) {  // backward beep
+      #ifdef DEBUG_I2C_LCD
+      LCD_SetLocation(&lcd, 8, 1);
+      if (errCode_Left) {
+        LCD_WriteString(&lcd, "L_");
+      } else if (errCode_Right) {
+        LCD_WriteString(&lcd, "R_");
+      }
+      if (errCode_Left == 1 || errCode_Right == 1) {
+        LCD_WriteString(&lcd, "HALNC");
+      }
+      if (errCode_Left == 2 || errCode_Right == 2) {
+        LCD_WriteString(&lcd, "HALSC");
+      }
+      if (errCode_Left == 4 || errCode_Right == 4) {
+        LCD_WriteString(&lcd, "MOT");
+      }
+      enable = 0;
+      #endif
+    } else if (BEEPS_BACKWARD && ((rtY_Left.n_mot-rtY_Right.n_mot) / 2) < -50) {  // backward beep
       buzzerFreq = 5;
       buzzerPattern = 1;
     } else {  // do not beep
@@ -616,13 +791,13 @@ void filtLowPass32(int32_t u, uint16_t coef, int32_t *y)
   * Outputs:      rty_speedR, rty_speedL                = int16_t
   * Parameters:   SPEED_COEFFICIENT, STEER_COEFFICIENT  = fixdt(0,16,14)
   */
-void mixerFcn(int16_t rtu_speed, int16_t rtu_steer, int16_t *rty_speedR, int16_t *rty_speedL)
+void mixerFcn(int16_t rtu_speed, int16_t rtu_steer, int16_t *rty_speedR, int16_t *rty_speedL, int16_t speedCoefficient)
 {
   int16_t prodSpeed;
   int16_t prodSteer;
   int32_t tmp;
 
-  prodSpeed   = (int16_t)((rtu_speed * (int16_t)SPEED_COEFFICIENT) >> 14);
+  prodSpeed   = (int16_t)((rtu_speed * (int16_t)speedCoefficient) >> 14);
   prodSteer   = (int16_t)((rtu_steer * (int16_t)STEER_COEFFICIENT) >> 14);
 
   tmp         = prodSpeed - prodSteer;  
